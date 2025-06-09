@@ -1,6 +1,6 @@
 ninja
 pybind11
-
+boto3
 diffusers
 einops
 opencv-python

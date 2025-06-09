@@ -40,6 +40,9 @@ from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline, FloaterRemover, D
     MeshSimplifier
 from hy3dgen.texgen import Hunyuan3DPaintPipeline
 from hy3dgen.text2image import HunyuanDiTPipeline
+import boto3
+from botocore.exceptions import BotoCoreError, NoCredentialsError
+import mimetypes
 
 LOGDIR = '.'
 
@@ -47,6 +50,36 @@ server_error_msg = "**NETWORK ERROR DUE TO HIGH TRAFFIC. PLEASE REGENERATE OR RE
 moderation_msg = "YOUR INPUT VIOLATES OUR CONTENT MODERATION GUIDELINES. PLEASE TRY AGAIN."
 
 handler = None
+
+S3_BUCKET_NAME = "genies-ml-rnd"
+S3_REGION = "us-west-2"
+S3_KEY = "hunyuan3d/api_runs"
+
+
+def upload_to_s3(file_path: str,) -> str:
+    s3_client = boto3.client("s3")
+    try:
+        with open(file_path, "rb") as f:
+            data = f.read()
+
+        content_type, _ = mimetypes.guess_type(file_path)
+        content_type = content_type or "application/octet-stream"
+
+        filename = os.path.basename(file_path)
+        unique_id = str(uuid.uuid4())
+        key = f"{S3_KEY}/{unique_id}/{filename}"
+
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=key,
+            Body=data,
+            ContentType=content_type
+        )
+
+        return f"s3://{S3_BUCKET_NAME}/{key}"
+
+    except (BotoCoreError, NoCredentialsError, FileNotFoundError) as e:
+        raise RuntimeError(f"S3 upload failed: {e}")
 
 
 def build_logger(logger_name, logger_filename):
@@ -149,7 +182,7 @@ class ModelWorker:
                  tex_model_path='tencent/Hunyuan3D-2',
                  subfolder='hunyuan3d-dit-v2-mini-turbo',
                  device='cuda',
-                 enable_tex=False):
+                 enable_tex=True):
         self.model_path = model_path
         self.worker_id = worker_id
         self.device = device
@@ -212,7 +245,7 @@ class ModelWorker:
             mesh = self.pipeline(**params)[0]
             logger.info("--- %s seconds ---" % (time.time() - start_time))
 
-        if params.get('texture', False):
+        if params.get('texture', True):
             mesh = FloaterRemover()(mesh)
             mesh = DegenerateFaceRemover()(mesh)
             mesh = FaceReducer()(mesh, max_facenum=params.get('face_count', 40000))
@@ -248,7 +281,8 @@ async def generate(request: Request):
     uid = uuid.uuid4()
     try:
         file_path, uid = worker.generate(uid, params)
-        return FileResponse(file_path)
+        s3_url = upload_to_s3(file_path,)
+        return JSONResponse({"s3_url": s3_url}, status_code=200)
     except ValueError as e:
         traceback.print_exc()
         print("Caught ValueError:", e)
@@ -289,6 +323,7 @@ async def status(uid: str):
     save_file_path = os.path.join(SAVE_DIR, f'{uid}.glb')
     print(save_file_path, os.path.exists(save_file_path))
     if not os.path.exists(save_file_path):
+
         response = {'status': 'processing'}
         return JSONResponse(response, status_code=200)
     else:
@@ -311,6 +346,6 @@ if __name__ == "__main__":
 
     model_semaphore = asyncio.Semaphore(args.limit_model_concurrency)
 
-    worker = ModelWorker(model_path=args.model_path, device=args.device, enable_tex=args.enable_tex,
+    worker = ModelWorker(model_path=args.model_path, device=args.device, enable_tex=True,
                          tex_model_path=args.tex_model_path)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
