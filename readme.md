@@ -37,7 +37,6 @@ Once the server is running, you can use the `client_script.py` to send image-to-
 ```bash
 python client_script.py
 ```
-🔁 Note: The public IP is not static. You must update the IP address in the client script each time the instance is restarted.
 
 📂 Output
 Generated 3D models ( .glb) will be  uploaded to S3 (`s3://genies-ml-rnd/hunyuan3d/api_runs/`) and downloaded and saved locally, you can change the client script to fit your needs.

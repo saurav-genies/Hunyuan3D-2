@@ -43,6 +43,8 @@ from hy3dgen.text2image import HunyuanDiTPipeline
 import boto3
 from botocore.exceptions import BotoCoreError, NoCredentialsError
 import mimetypes
+import time
+from urllib.parse import urlparse
 
 LOGDIR = '.'
 
@@ -55,6 +57,24 @@ S3_BUCKET_NAME = "genies-ml-rnd"
 S3_REGION = "us-west-2"
 S3_KEY = "hunyuan3d/api_runs"
 
+
+def download_s3_to_image(s3_uri):
+    parsed = urlparse(s3_uri)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        boto3.client("s3").download_fileobj(bucket, key, f)
+        return Image.open(f.name)
+
+
+def download_s3_to_bytesio(s3_uri):
+    parsed = urlparse(s3_uri)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    buf = BytesIO()
+    boto3.client("s3").download_fileobj(bucket, key, buf)
+    buf.seek(0)
+    return buf
 
 def upload_to_s3(file_path: str,) -> str:
     s3_client = boto3.client("s3")
@@ -182,7 +202,8 @@ class ModelWorker:
                  tex_model_path='tencent/Hunyuan3D-2',
                  subfolder='hunyuan3d-dit-v2-mini-turbo',
                  device='cuda',
-                 enable_tex=True):
+                 enable_tex=True,
+                 enable_mv=True,):
         self.model_path = model_path
         self.worker_id = worker_id
         self.device = device
@@ -195,11 +216,14 @@ class ModelWorker:
             use_safetensors=True,
             device=device,
         )
+        if enable_mv:
+            self.pipeline_mv = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+                "tencent/Hunyuan3D-2mv",
+                subfolder="hunyuan3d-dit-v2-mv-turbo",
+                variant='fp16',)
+
         self.pipeline.enable_flashvdm(mc_algo='mc')
-        # self.pipeline_t2i = HunyuanDiTPipeline(
-        #     'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled',
-        #     device=device
-        # )
+
         if enable_tex:
             self.pipeline_tex = Hunyuan3DPaintPipeline.from_pretrained(tex_model_path)
 
@@ -218,34 +242,79 @@ class ModelWorker:
 
     @torch.inference_mode()
     def generate(self, uid, params):
-        if 'image' in params:
-            image = params["image"]
-            image = load_image_from_base64(image)
-        else:
-            if 'text' in params:
-                text = params["text"]
-                image = self.pipeline_t2i(text)
-            else:
-                raise ValueError("No input image or text provided")
 
-        image = self.rembg(image)
-        params['image'] = image
+
+        multiview_images = None
+
+        if 'image' in params:
+            if isinstance(params['image'], str) and params['image'].startswith("s3://"):
+                image = download_s3_to_image(params["image"])
+            else:
+                raise ValueError("Image must be a valid S3 URI starting with 's3://'")
+            image = self.rembg(image)
+            params['image'] = image
+
+        elif 'images' in params:
+            multiview_images = params['images']
+            for key in multiview_images:
+                img_val = multiview_images[key]
+                if img_val.startswith("s3://"):
+                    image = download_s3_to_image(img_val)
+                else:
+                    raise ValueError(f"Image path for view '{key}' must be a valid S3 URI starting with 's3://'")
+
+                image = image.convert("RGBA")
+                if image.mode == 'RGB':
+                    image = self.rembg(image)
+                multiview_images[key] = image
+
+            params['image'] = multiview_images
+            del params['images']
+            image = multiview_images.get("front")
+
+        elif 'text' in params:
+            text = params["text"]
+            image = self.pipeline_t2i(text)
+            image = self.rembg(image)
+            params['image'] = image
+
+        else:
+            raise ValueError("No input image(s) or text provided")
 
         if 'mesh' in params:
-            mesh = trimesh.load(BytesIO(base64.b64decode(params["mesh"])), file_type='glb')
+            mesh_data = params["mesh"]
+            if isinstance(mesh_data, str) and mesh_data.startswith("s3://"):
+                buf = download_s3_to_bytesio(mesh_data)
+            else:
+                raise ValueError("Mesh Path must be a valid S3 URI starting with 's3://'")
+            mesh = trimesh.load(buf, file_type='glb')
+            logger.info("Mesh provided — running texture-only pipeline.")
         else:
-            seed = params.get("seed", 1234)
+            seed = params.get("seed", 12345)
             params['generator'] = torch.Generator(self.device).manual_seed(seed)
-            params['octree_resolution'] = params.get("octree_resolution", 128)
-            params['num_inference_steps'] = params.get("num_inference_steps", 5)
+            params['octree_resolution'] = params.get("octree_resolution", 380)
+            params['num_inference_steps'] = params.get("num_inference_steps", 50)
             params['guidance_scale'] = params.get('guidance_scale', 5.0)
-            params['mc_algo'] = 'mc'
+            params['num_chunks'] = params.get('num_chunks', 20000)
             import time
             start_time = time.time()
-            mesh = self.pipeline(**params)[0]
+            print(f"Generating mesh with params: {params}")
+            if multiview_images:
+                logger.info("Using multiview images for mesh generation.")
+                mesh = self.pipeline_mv(
+                    image=multiview_images,
+                    num_inference_steps=50,
+                    octree_resolution=380,
+                    num_chunks=20000,
+                    generator=torch.manual_seed(12345),
+                    output_type='trimesh'
+                )[0]
+            else:
+                logger.info("Using single image for mesh generation.")
+                mesh = self.pipeline(**params)[0]
             logger.info("--- %s seconds ---" % (time.time() - start_time))
 
-        if params.get('texture', True):
+        if params.get('texture', False):
             mesh = FloaterRemover()(mesh)
             mesh = DegenerateFaceRemover()(mesh)
             mesh = FaceReducer()(mesh, max_facenum=params.get('face_count', 40000))
@@ -306,6 +375,7 @@ async def generate(request: Request):
             "error_code": 1,
         }
         return JSONResponse(ret, status_code=404)
+
 
 
 @app.post("/send")
